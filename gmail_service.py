@@ -1,5 +1,7 @@
 import os
 import base64
+import re
+import html
 from email.utils import parseaddr
 from database import create_database, save_email
 
@@ -40,36 +42,88 @@ def get_gmail_service():
     )
 
     return service
+def clean_html(html_text):
+    from html import unescape
+    import re
 
+    if not html_text:
+        return ""
+
+    text = re.sub(
+        r"<script.*?</script>",
+        "",
+        html_text,
+        flags=re.DOTALL | re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"<style.*?</style>",
+        "",
+        text,
+        flags=re.DOTALL | re.IGNORECASE
+    )
+
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+
+    text = unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+
+    return text.strip()
 def get_email_body(payload):
-    body = ""
+    def decode_data(data):
+        if not data:
+            return ""
 
-    if payload.get("body", {}).get("data"):
-        data = payload["body"]["data"]
-        body = base64.urlsafe_b64decode(data).decode(
-            "utf-8",
-            errors="ignore"
-        )
+        try:
+            return base64.urlsafe_b64decode(data).decode(
+                "utf-8",
+                errors="ignore"
+            )
+        except Exception:
+            return ""
 
-    elif payload.get("parts"):
-        for part in payload["parts"]:
-            if part.get("mimeType") == "text/plain":
-                data = part.get("body", {}).get("data")
+    def find_mime_type(part, wanted_type):
+        # Check this part
+        if part.get("mimeType") == wanted_type:
+            data = part.get("body", {}).get("data")
 
-                if data:
-                    body = base64.urlsafe_b64decode(data).decode(
-                        "utf-8",
-                        errors="ignore"
-                    )
-                    break
+            if data:
+                decoded = decode_data(data)
 
-            if part.get("parts"):
-                body = get_email_body(part)
+                if decoded:
+                    return decoded
 
-                if body:
-                    break
+        # Check all child/nested parts
+        for child in part.get("parts", []):
+            result = find_mime_type(child, wanted_type)
 
-    return body
+            if result:
+                return result
+
+        return ""
+
+    # FIRST: Search the entire email for HTML
+    html_body = find_mime_type(payload, "text/html")
+
+    if html_body:
+        return clean_html(html_body)
+
+    # SECOND: If no HTML exists, use plain text
+    plain_body = find_mime_type(payload, "text/plain")
+
+    if plain_body:
+        return plain_body
+
+    # LAST: Check direct body
+    direct_data = payload.get("body", {}).get("data")
+
+    if direct_data:
+        return decode_data(direct_data)
+
+    return ""
 def fetch_emails(service):
     results = service.users().messages().list(
         userId="me",
